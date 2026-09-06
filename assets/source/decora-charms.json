@@ -1,0 +1,10 @@
+{
+  "service": "local Ideogram",
+  "model": "V4_TURBO_12",
+  "seed": 2036734985,
+  "width": 1536,
+  "height": 1024,
+  "source": "decora-charms.png",
+  "review": "Inspected full source and cutout. Cropped independent ornaments with edge-connected white removal, preserving white pearls and sticker rims.",
+  "prompt": "A luxury maximalist Japanese Decora scrapbook stationery sticker collection for a ruby-pink RSS reader. Flat lay of twelve separate individual glossy enamel charms, ribbon bows, tiny pink roses, ruby crystal hearts with gold outlines, pastel shooting stars, pearl loops, a pink winged envelope, holographic miniature butterflies. Every charm entirely isolated from all other charms by wide pure WHITE empty margins, clean flat pure WHITE background. Cute punk personal website 1999 aesthetic, candy pink ruby red cream lavender mint, intricate dimensional polished finish, beautiful crisp crafted detail. No words, no letters, no text, no watermark. Each ornament separated and completely inside frame, designed for cutout."
+}

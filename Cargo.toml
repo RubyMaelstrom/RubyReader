@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/reader-core", "crates/reader-desktop"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+url = "2"
+
+[patch.crates-io]
+fontique = { path = "../TRust/vendor/fontique-0.11.1" }
+crossterm = { path = "../TRust/vendor/crossterm-0.29.0" }
+image-webp = { path = "../TRust/vendor/image-webp-0.2.4" }
+vello_hybrid = { path = "../TRust/vendor/vello_hybrid-0.2.0" }
+wasmi = { path = "../TRust/vendor/wasmi-1.1.0" }
+wasmi_core = { path = "../TRust/vendor/wasmi_core-1.1.0" }
+wasmi_ir = { path = "../TRust/vendor/wasmi_ir-1.1.0" }
+wasmi_collections = { path = "../TRust/vendor/wasmi_collections-1.1.0" }
+ratatui-image = { path = "../TRust/vendor/ratatui-image-11.0.6" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 8
+strip = "symbols"

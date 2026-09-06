@@ -1,0 +1,45 @@
+# Generated builds, test libraries, captures, and packaging output.
+/target/
+/artifacts/
+/dist/
+/tmp/
+/scratch/
+*.log
+*.profraw
+*.profdata
+
+# Personal libraries, exports, and caches (never publish feed credentials).
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+*.opml
+*.sock
+/cache/
+
+# Local working notes and machine-specific test reports.
+/notes/
+/.notes/
+/docs/
+*.local.md
+/AGENTS.md
+/.codex/
+/.claude/
+
+# Credentials and local environment files.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+
+# Editor and operating-system clutter.
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

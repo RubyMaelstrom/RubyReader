@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ruby Reader
+Comment=A little corner of the internet, entirely yours
+Exec=ruby-reader
+Icon=ruby-reader
+Terminal=false
+Categories=Network;News;Feed;
+Keywords=RSS;Atom;Feeds;News;Reader;
+StartupNotify=true
+StartupWMClass=ruby-reader

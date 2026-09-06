@@ -1,0 +1,23 @@
+[package]
+name = "ruby-reader"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+reader-core = { path = "../reader-core" }
+trust = { package = "TRust", path = "../../../TRust" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+winit = "0.30.13"
+softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen", "x11", "x11-dlopen"] }
+accesskit = "0.24.1"
+accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+ksni = "0.3"
+notify-rust = { version = "4", default-features = false, features = ["z"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+base64 = "0.22"

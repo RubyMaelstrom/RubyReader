@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1536" height="1024" viewBox="0 0 1536 1024">
+  <defs>
+    <pattern id="gingham" width="24" height="24" patternUnits="userSpaceOnUse">
+      <rect width="24" height="24" fill="#ffd7e7"/>
+      <rect width="12" height="24" fill="#fff0f5" opacity=".72"/>
+      <rect width="24" height="12" fill="#fff0f5" opacity=".72"/>
+      <path d="M0 0H24M0 0V24" stroke="#c96390" stroke-width=".5" opacity=".2"/>
+    </pattern>
+    <pattern id="lace" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M0 12Q6 0 12 12T24 12M0 12Q6 24 12 12T24 12" fill="none" stroke="#fffef7" stroke-width="2"/>
+      <circle cx="12" cy="12" r="3" fill="#e6ae75" stroke="#fffdf4" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1536" height="1024" fill="url(#gingham)"/>
+  <rect width="12" height="1024" fill="url(#lace)"/>
+  <rect x="1524" width="12" height="1024" fill="url(#lace)"/>
+</svg>
