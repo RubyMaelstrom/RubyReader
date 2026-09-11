@@ -48,7 +48,8 @@ a:hover { color:#ad1453; }
 .feed { display:flex;align-items:center;gap:4px; }
 .feed-name { flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
 .feed .count { float:none;flex-shrink:0; }
-.feed-actions { text-align:right;line-height:8px;color:#b08499;padding-right:5px; }
+.feed-actions { text-align:right;line-height:8px;color:#b08499;padding-right:5px;opacity:0;pointer-events:none; }
+.feed-row:hover .feed-actions,#keyboard-feed-row .feed-actions { opacity:1;pointer-events:auto; }
 .charm-board { position:relative;height:320px;margin:22px 5px 0;border:2px dashed #d999b6;border-radius:16px;background:linear-gradient(135deg,#ffe0ed,#f2e6fb 55%,#e0f7ef);box-shadow:2px 3px 0 #e6b2cd; }
 .charm-chain { position:absolute;left:12%;top:26px;width:76%;height:235px;border:4px dotted #fefaf2;border-radius:48%;transform:rotate(-12deg); }
 .keepsake-caption { color:#a37585;font-family:'Ruby Serif',serif;font-style:italic;font-size:11px;line-height:1.6;text-align:center;margin:14px 0 6px; }

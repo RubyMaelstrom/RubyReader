@@ -70,6 +70,122 @@ mod tests {
     }
 
     #[test]
+    fn feed_actions_reveal_only_for_hover_or_keyboard_without_layout_shift() {
+        let snap = Snapshot {
+            feeds: (1..=2)
+                .map(|id| Feed {
+                    id,
+                    title: format!("Sample feed {id}"),
+                    url: format!("https://example.test/{id}"),
+                    folder_id: None,
+                    unread: 4,
+                    error: (id == 2).then(|| "Offline".into()),
+                    last_refresh: None,
+                    etag: None,
+                    modified: None,
+                    failures: 0,
+                    next_refresh: 0,
+                    initialized: true,
+                })
+                .collect(),
+            folders: vec![],
+            articles: vec![],
+            total: 8,
+            all: 8,
+            unread: 8,
+            saved: 0,
+            settings: Settings::default(),
+        };
+        let mut doc = document(
+            &sidebar(Some(&snap), &View::Feed(1), &Decora::seeded(42)),
+            "",
+            Url::parse(ASSET_BASE).unwrap(),
+            CssSize::new(244.0, 700.0),
+            ImageStore::default(),
+        );
+        let link = |href: &str| {
+            doc.dom
+                .descendants(trust::dom::DOCUMENT)
+                .find(|&node| doc.dom.attr(node, "href") == Some(href))
+                .unwrap()
+        };
+        let feed = link("app:feed:1");
+        let edit = link("app:feed-edit:1");
+        let refresh = link("app:feed-refresh:1");
+        let retry = link("app:feed-refresh:2");
+        let actions = doc.dom.node(edit).parent.unwrap();
+        let other_actions = doc.dom.node(retry).parent.unwrap();
+        let geometry = doc.layout.boxes.clone();
+        let opacity =
+            |doc: &EmbeddedDocument, node| doc.dom.computed_value(node, "opacity").unwrap();
+        assert_eq!(opacity(&doc, actions), "0", "Selection is not hover");
+        assert_eq!(opacity(&doc, other_actions), "0");
+        assert_eq!(
+            doc.dom.computed_value(edit, "pointer-events").as_deref(),
+            Some("none")
+        );
+        assert!(
+            doc.semantics(None)
+                .nodes
+                .iter()
+                .any(|n| n.dom_node == Some(edit)),
+            "Unrevealed controls remain available to assistive technology"
+        );
+
+        let render = |doc: &EmbeddedDocument| {
+            let metrics =
+                ViewportMetrics::from_physical(PhysicalSize::new(244, 700), ScaleFactor::default());
+            trust::render::vello_cpu::VelloCpuRenderer::new()
+                .render_rgba(&doc.scene(
+                    metrics,
+                    CssRect::new(0.0, 0.0, 244.0, 700.0),
+                    CssPoint::default(),
+                    0.0,
+                ))
+                .unwrap()
+                .pixels
+        };
+        let hidden = render(&doc);
+        doc.hover(Some(feed));
+        assert_eq!(opacity(&doc, actions), "1");
+        assert_eq!(opacity(&doc, other_actions), "0");
+        assert_ne!(hidden, render(&doc), "Hover feedback is actually painted");
+        for node in [edit, refresh] {
+            doc.hover(Some(node));
+            assert_eq!(
+                opacity(&doc, actions),
+                "1",
+                "Moving onto controls keeps them visible"
+            );
+            assert_eq!(
+                doc.dom.computed_value(node, "pointer-events").as_deref(),
+                Some("auto")
+            );
+        }
+        doc.hover(None);
+        assert_eq!(render(&doc), hidden, "Leaving restores the uncluttered row");
+        for node in [feed, edit, refresh] {
+            focus_feed_actions(&mut doc, Some(node));
+            assert_eq!(opacity(&doc, actions), "1");
+            assert_eq!(opacity(&doc, other_actions), "0");
+        }
+        focus_feed_actions(&mut doc, Some(retry));
+        assert_eq!(opacity(&doc, actions), "0");
+        assert_eq!(opacity(&doc, other_actions), "1");
+        assert_ne!(
+            render(&doc),
+            hidden,
+            "Keyboard focus visibly reveals controls"
+        );
+        focus_feed_actions(&mut doc, None);
+        assert_eq!(render(&doc), hidden);
+        assert_eq!(
+            doc.layout.boxes, geometry,
+            "Revealing controls never moves rows"
+        );
+    }
+
+    #[test]
     fn all_visible_decora_documents_share_a_non_repeating_collection() {
         for seed in 0..24 {
             let decora = Decora::seeded(seed);
@@ -572,7 +688,7 @@ pub fn sidebar(snap: Option<&Snapshot>, view: &View, decora: &Decora) -> String 
                     feed.unread
                 );
                 out.push_str(&format!(
-                    "<div style='padding-left:{}px'>{}<div class='feed-actions'>{} {}</div></div>",
+                    "<div class='feed-row' style='padding-left:{}px'>{}<div class='feed-actions'>{} {}</div></div>",
                     depth * 8,
                     a(
                         &format!("feed:{}", feed.id),
@@ -622,6 +738,30 @@ pub fn sidebar(snap: Option<&Snapshot>, view: &View, decora: &Decora) -> String 
     }
     out.push_str(&format!("</div><p class='keepsake-caption'>Collected with curiosity.<br>Read at your own pace.</p>{}</div>", a("sample", "Try the sample scrapbook", "sample-link")));
     out
+}
+
+/// TRust's embedded surface has native focus, not CSS :focus-within state.
+/// Reveal the keyboard-focused row without changing layout or hiding its links
+/// from Tab/assistive technology. Pointer hover remains independent.
+pub fn focus_feed_actions(doc: &mut EmbeddedDocument, focused: Option<usize>) {
+    let mut row = focused.filter(|node| doc.layout.boxes.contains_key(node));
+    while let Some(node) = row {
+        if doc.dom.attr(node, "class") == Some("feed-row") {
+            break;
+        }
+        row = doc.dom.node(node).parent;
+    }
+    let previous = doc.dom.get_by_id("keyboard-feed-row");
+    if previous == row {
+        return;
+    }
+    if let Some(node) = previous {
+        doc.dom.remove_attr(node, "id");
+    }
+    if let Some(node) = row {
+        doc.dom.set_attr(node, "id", "keyboard-feed-row");
+    }
+    doc.relayout();
 }
 
 pub fn headlines(snap: Option<&Snapshot>, selected: Option<i64>, query: &Query) -> String {

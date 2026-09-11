@@ -367,6 +367,14 @@ impl App {
             let Some(surface) = &mut self.surfaces[index] else {
                 continue;
             };
+            if index == 1 {
+                ui::focus_feed_actions(
+                    &mut surface.doc,
+                    self.focus_target
+                        .filter(|(i, _)| *i == 1 && self.keyboard_focus && self.dialog.is_none())
+                        .map(|(_, node)| node),
+                );
+            }
             if index == 4 {
                 scene.primitives.push(Paint::FillRect {
                     rect: CssRect::new(0.0, 0.0, self.geometry.width, self.geometry.height),
@@ -759,6 +767,7 @@ fn empty_scene(metrics: ViewportMetrics, store: ImageStore) -> Scene {
         controls: vec![],
         content_viewport: CssRect::new(0.0, 0.0, metrics.css.width, metrics.css.height),
         image_store: store,
+        canvas_images: Default::default(),
         page_scroll_containers: vec![],
         page_size: CssSize::default(),
     }
@@ -1553,6 +1562,22 @@ impl App {
         if let Some((_, editor)) = &mut self.editor {
             let input = KeyInput {
                 key: translate_key(&event.logical_key),
+                code: match event.physical_key {
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::SuperLeft) => {
+                        String::from("MetaLeft")
+                    }
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::SuperRight) => {
+                        String::from("MetaRight")
+                    }
+                    winit::keyboard::PhysicalKey::Code(code) => format!("{code:?}"),
+                    _ => String::new(),
+                },
+                location: match event.location {
+                    winit::keyboard::KeyLocation::Standard => 0,
+                    winit::keyboard::KeyLocation::Left => 1,
+                    winit::keyboard::KeyLocation::Right => 2,
+                    winit::keyboard::KeyLocation::Numpad => 3,
+                },
                 state: KeyState::Pressed,
                 modifiers: Modifiers {
                     shift: self.modifiers.shift_key(),
@@ -2221,6 +2246,12 @@ impl ApplicationHandler<Event> for App {
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => self.pointer_move(position),
+            WindowEvent::CursorLeft { .. } => {
+                for surface in self.surfaces.iter_mut().flatten() {
+                    surface.doc.hover(None);
+                }
+                self.redraw();
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -2314,6 +2345,103 @@ impl ApplicationHandler<Event> for App {
             match self.smoke_step {
                 0 => {
                     self.smoke_capture("welcome");
+                    // Feed controls reveal through the actual pointer path,
+                    // remain clickable, and can also be reached with Tab.
+                    let surface = self.surfaces[1].as_ref().unwrap();
+                    let feed = surface
+                        .doc
+                        .dom
+                        .descendants(trust::dom::DOCUMENT)
+                        .find(|&n| {
+                            surface
+                                .doc
+                                .dom
+                                .attr(n, "href")
+                                .is_some_and(|h| h.starts_with("app:feed:"))
+                        })
+                        .expect("Smoke: sample subscription");
+                    let edit = surface
+                        .doc
+                        .dom
+                        .descendants(trust::dom::DOCUMENT)
+                        .find(|&n| {
+                            surface
+                                .doc
+                                .dom
+                                .attr(n, "href")
+                                .is_some_and(|h| h.starts_with("app:feed-edit:"))
+                        })
+                        .unwrap();
+                    let actions = surface.doc.dom.node(edit).parent.unwrap();
+                    assert_eq!(
+                        surface
+                            .doc
+                            .dom
+                            .computed_value(actions, "opacity")
+                            .as_deref(),
+                        Some("0")
+                    );
+                    let feed_rect = node_rect(surface, feed).unwrap();
+                    let scale = self.metrics.scale_factor.get();
+                    self.pointer_move(PhysicalPosition::new(
+                        (feed_rect.x + 30.0) as f64 * scale,
+                        (feed_rect.y + feed_rect.height * 0.5) as f64 * scale,
+                    ));
+                    self.smoke_capture("feed-hover");
+                    let surface = self.surfaces[1].as_ref().unwrap();
+                    assert_eq!(
+                        surface
+                            .doc
+                            .dom
+                            .computed_value(actions, "opacity")
+                            .as_deref(),
+                        Some("1")
+                    );
+                    let edit_rect = node_rect(surface, edit).unwrap();
+                    self.pointer_move(PhysicalPosition::new(
+                        (edit_rect.x + edit_rect.width * 0.5) as f64 * scale,
+                        (edit_rect.y + edit_rect.height * 0.5) as f64 * scale,
+                    ));
+                    self.mouse(ElementState::Pressed, event_loop);
+                    self.mouse(ElementState::Released, event_loop);
+                    assert!(
+                        matches!(self.dialog, Some(Dialog::EditFeed(_))),
+                        "Smoke: hovered edit is clickable"
+                    );
+                    self.smoke_click("cancel", event_loop);
+                    self.pointer_move(PhysicalPosition::new(420.0 * scale, 105.0 * scale));
+                    self.focus_target = Some((1, feed));
+                    self.focus_next(false);
+                    self.compose();
+                    assert_eq!(
+                        self.focus_target,
+                        Some((1, edit)),
+                        "Smoke: Tab reaches edit"
+                    );
+                    assert_eq!(
+                        self.surfaces[1]
+                            .as_ref()
+                            .unwrap()
+                            .doc
+                            .dom
+                            .computed_value(actions, "opacity")
+                            .as_deref(),
+                        Some("1")
+                    );
+                    self.smoke_capture("feed-keyboard");
+                    self.focus_target = None;
+                    self.keyboard_focus = false;
+                    self.compose();
+                    assert_eq!(
+                        self.surfaces[1]
+                            .as_ref()
+                            .unwrap()
+                            .doc
+                            .dom
+                            .computed_value(actions, "opacity")
+                            .as_deref(),
+                        Some("0")
+                    );
                     // Actual pointer path: blank decoration cannot become a
                     // focus box, and a visible charm is a local fidget, not a
                     // link, article selection, or image enlargement.
