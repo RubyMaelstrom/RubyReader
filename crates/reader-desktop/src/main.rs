@@ -1,7 +1,10 @@
 mod backend;
 mod decora;
 mod desktop;
+mod documents;
+mod full_article;
 mod platform;
+mod theme;
 mod ui;
 
 use backend::{Backend, Event};
@@ -66,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     if args.contains(&"--sample".into()) {
         backend.store.lock().unwrap().sample()?;
     }
-    let mut app = desktop::App::new(backend, renderer, args.contains(&"--smoke".into()));
+    let mut app = desktop::App::new(backend, renderer, args.contains(&"--smoke".into()))?;
     event_loop.run_app(&mut app)?;
     Ok(())
 }

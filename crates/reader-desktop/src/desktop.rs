@@ -1,12 +1,15 @@
 use crate::{
     backend::{Backend, Event},
     decora::Decora,
+    documents::{DocumentWorker, FindHighlights},
+    full_article::FullArticle,
     platform,
+    theme::Theme,
     ui::{self, Dialog, Geometry},
 };
 use reader_core::{db::Store, model::*};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     num::NonZeroU32,
     path::Path,
     sync::Arc,
@@ -17,10 +20,10 @@ use trust::{
         CssPoint, CssSize, ImeAction, Key, KeyInput, KeyState, Modifiers, PhysicalSize,
         ScaleFactor, ViewportMetrics,
     },
-    embed::EmbeddedDocument,
+    embed::EmbeddedSnapshot,
     render::{
-        CssRect, DisplayCommand as Paint, EditorVisual, ImageStore, PaintColor, RasterBackend,
-        Scene, TextSelection,
+        CssRect, DisplayCommand as Paint, EditorVisual, ImageStore, RasterBackend, Scene,
+        TextSelection,
     },
     text::{TextEditor, TextStyle},
 };
@@ -34,11 +37,21 @@ use winit::{
 };
 
 struct Surface {
-    source: String,
-    doc: EmbeddedDocument,
+    generation: u64,
+    revision: u64,
+    doc: EmbeddedSnapshot,
     rect: CssRect,
     scroll: CssPoint,
     scene: Option<Scene>,
+    cached: Option<(CssRect, CssPoint, Scene)>,
+}
+struct DocumentRequest {
+    source: String,
+    base: url::Url,
+    rect: CssRect,
+    generation: u64,
+    scroll: CssPoint,
+    failed: bool,
 }
 enum Presenter {
     Gpu(Box<trust::render::vello_hybrid::VelloHybridRenderer>),
@@ -104,8 +117,11 @@ pub struct App {
     serial: u64,
     selected: Option<i64>,
     article: Option<Article>,
-    full: bool,
+    article_serial: u64,
+    full_article: FullArticle,
     surfaces: [Option<Surface>; 5],
+    documents: [DocumentWorker; 5],
+    requests: [Option<DocumentRequest>; 5],
     store: ImageStore,
     geometry: Geometry,
     metrics: ViewportMetrics,
@@ -134,22 +150,34 @@ pub struct App {
     last_refresh: Instant,
     read_since: Option<Instant>,
     manually_unread: Option<i64>,
-    images: HashSet<String>,
+    image_scroll: Option<(u64, CssPoint)>,
     find: String,
     find_index: usize,
+    find_highlights: FindHighlights,
+    find_pending: Option<bool>,
+    article_scroll: Option<CssPoint>,
+    pending_pointer: Option<PhysicalPosition<f64>>,
+    last_pointer: Instant,
+    accessibility_dirty: bool,
     smoke: bool,
     smoke_step: usize,
     smoke_time: Instant,
 }
 
 impl App {
-    pub fn new(backend: Backend, renderer_preference: String, smoke: bool) -> Self {
+    pub fn new(backend: Backend, renderer_preference: String, smoke: bool) -> anyhow::Result<Self> {
         let settings = backend.store.lock().unwrap().settings().unwrap_or_default();
         let metrics = ViewportMetrics::from_physical(
             PhysicalSize::new(settings.window_width, settings.window_height),
             ScaleFactor::default(),
         );
-        Self {
+        let documents = (0..5)
+            .map(|i| DocumentWorker::new(i, backend.proxy.clone()))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .ok()
+            .unwrap();
+        Ok(Self {
             backend,
             renderer_preference,
             window: None,
@@ -166,8 +194,11 @@ impl App {
             serial: 0,
             selected: None,
             article: None,
-            full: true,
+            article_serial: 0,
+            full_article: FullArticle::default(),
             surfaces: std::array::from_fn(|_| None),
+            documents,
+            requests: std::array::from_fn(|_| None),
             store: ImageStore::default(),
             pointer: CssPoint::default(),
             modifiers: ModifiersState::empty(),
@@ -194,13 +225,19 @@ impl App {
             last_refresh: Instant::now(),
             read_since: None,
             manually_unread: None,
-            images: HashSet::new(),
+            image_scroll: None,
             find: String::new(),
             find_index: 0,
+            find_highlights: FindHighlights::default(),
+            find_pending: None,
+            article_scroll: None,
+            pending_pointer: None,
+            last_pointer: Instant::now(),
+            accessibility_dirty: true,
             smoke,
             smoke_step: 0,
             smoke_time: Instant::now(),
-        }
+        })
     }
     fn redraw(&self) {
         if self.visible
@@ -255,31 +292,196 @@ impl App {
     ) {
         let source = format!("{extra}\n{body}");
         let size = CssSize::new(rect.width, rect.height);
-        if let Some(surface) = &mut self.surfaces[index]
-            && surface.source == source
-            && surface.doc.base() == &base
+        if let Some(request) = &mut self.requests[index]
+            && request.source == source
+            && request.base == base
         {
-            surface.rect = rect;
-            surface.doc.resize(size);
-            surface.scroll = surface.doc.clamp_scroll(surface.scroll);
+            if request.rect.width != rect.width || request.rect.height != rect.height {
+                self.documents[index].resize(size);
+            }
+            request.rect = rect;
+            if let Some(surface) = &mut self.surfaces[index] {
+                surface.rect = rect;
+            }
             return;
         }
         let scroll = self.surfaces[index]
             .as_ref()
             .map_or(CssPoint::default(), |s| s.scroll);
-        let doc = ui::document(&body, &extra, base, size, self.store.clone());
-        let scroll = doc.clamp_scroll(scroll);
-        self.surfaces[index] = Some(Surface {
+        let generation = self.documents[index].replace(
+            ui::document_html(&body, &extra).into(),
+            base.clone(),
+            size,
+            self.store.clone(),
+        );
+        self.requests[index] = Some(DocumentRequest {
             source,
+            base,
+            rect,
+            generation,
+            scroll,
+            failed: false,
+        });
+        if self.press.is_some_and(|(i, _, _)| i == index) {
+            self.press = None;
+        }
+        if index == 3 {
+            self.image_scroll = None;
+            self.find_highlights = FindHighlights::default();
+            if !self.find.is_empty() {
+                self.documents[index].find(self.find.clone());
+            }
+        }
+        if index == 4 {
+            self.surfaces[index] = None;
+        }
+    }
+    fn clear_surface(&mut self, index: usize) {
+        if self.requests[index].take().is_some() {
+            self.documents[index].clear();
+        }
+        self.surfaces[index] = None;
+    }
+    fn current_surface(&self, index: usize) -> bool {
+        self.surfaces[index].as_ref().is_some_and(|s| {
+            self.requests[index]
+                .as_ref()
+                .is_some_and(|r| r.generation == s.generation)
+        })
+    }
+    fn document_ready(&mut self, index: usize) {
+        let Some(ready) = self.documents[index].take_ready() else {
+            return;
+        };
+        let Some(request) = &self.requests[index] else {
+            return;
+        };
+        if request.generation != ready.generation {
+            return;
+        }
+        if self.surfaces[index]
+            .as_ref()
+            .is_some_and(|s| s.generation == ready.generation && s.revision >= ready.revision)
+        {
+            return;
+        }
+        let mut doc = match ready.result {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.surfaces[index] = None;
+                if index == 3 && !request.failed {
+                    let html = ui::document_html(
+                        &format!(
+                            "<main class='article'><h1>This story could not be displayed</h1><p>{}</p><p>You can still open its original page using the toolbar above.</p></main>",
+                            reader_core::content::escape(&error)
+                        ),
+                        &ui::article_css(&self.settings),
+                    );
+                    let generation = self.documents[index].replace(
+                        html.into(),
+                        request.base.clone(),
+                        CssSize::new(request.rect.width, request.rect.height),
+                        self.store.clone(),
+                    );
+                    if let Some(request) = &mut self.requests[index] {
+                        request.generation = generation;
+                        request.failed = true;
+                    }
+                }
+                self.message(error);
+                return;
+            }
+        };
+        if doc.viewport() != CssSize::new(request.rect.width, request.rect.height) {
+            return;
+        }
+        let rect = request.rect;
+        let old = self.surfaces[index].take();
+        let mut scroll = old.as_ref().map_or(request.scroll, |s| s.scroll);
+        if index == 3
+            && let Some(saved) = self.article_scroll.take()
+        {
+            scroll = saved;
+        }
+        if let Some(previous) = &old
+            && previous.generation == ready.generation
+        {
+            for container in &mut doc.layout.paint.scroll_containers {
+                if let Some(old) = previous
+                    .doc
+                    .layout
+                    .paint
+                    .scroll_containers
+                    .iter()
+                    .find(|c| c.node == container.node)
+                {
+                    container.offset = CssPoint::new(
+                        old.offset.x.clamp(
+                            0.0,
+                            (container.content.width - container.viewport.width).max(0.0),
+                        ),
+                        old.offset.y.clamp(
+                            0.0,
+                            (container.content.height - container.viewport.height).max(0.0),
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some((i, node)) = self.focus_target
+            && i == index
+            && old
+                .as_ref()
+                .is_none_or(|s| s.generation != ready.generation)
+        {
+            let href = old.as_ref().and_then(|s| s.doc.dom.attr(node, "href"));
+            self.focus_target = href
+                .and_then(|href| {
+                    doc.dom
+                        .descendants(trust::dom::DOCUMENT)
+                        .find(|&node| doc.dom.attr(node, "href") == Some(href))
+                })
+                .map(|node| (index, node));
+        }
+        if old.as_ref().is_some_and(|s| {
+            s.generation != ready.generation || s.doc.geometry_revision != doc.geometry_revision
+        }) && self.selection.is_some_and(|(i, _)| i == index)
+        {
+            self.selection = None;
+        }
+        scroll = doc.clamp_scroll(scroll);
+        self.surfaces[index] = Some(Surface {
+            generation: ready.generation,
+            revision: ready.revision,
             doc,
             rect,
             scroll,
             scene: None,
+            cached: None,
         });
+        if index == 3 {
+            if ready.find.query == self.find {
+                self.find_highlights = ready.find;
+                if let Some(next) = self.find_pending.take() {
+                    self.jump_find(next);
+                }
+            }
+            self.schedule_images();
+        }
+        self.accessibility_dirty = true;
+        if self.pointer.x >= 0.0 && self.pointer.y >= 0.0 {
+            let scale = self.metrics.scale_factor.get();
+            self.pending_pointer = Some(PhysicalPosition::new(
+                self.pointer.x as f64 * scale,
+                self.pointer.y as f64 * scale,
+            ));
+        }
+        self.redraw();
     }
     fn rebuild(&mut self) {
         self.metrics_for_window();
         let g = self.geometry;
+        let palette = Theme::from_name(&self.settings.reading_theme).css();
         let base = url::Url::parse("https://ruby-reader.invalid/").unwrap();
         self.set_surface(
             0,
@@ -292,7 +494,7 @@ impl App {
                 self.focus_mode,
                 &self.decora,
             ),
-            String::new(),
+            palette.clone(),
             CssRect::new(0.0, 0.0, g.width, g.height),
             base.clone(),
         );
@@ -300,20 +502,20 @@ impl App {
             self.set_surface(
                 1,
                 ui::sidebar(self.snapshot.as_ref(), &self.query.view, &self.decora),
-                String::new(),
+                palette.clone(),
                 g.sidebar,
                 base.clone(),
             );
             self.set_surface(
                 2,
                 ui::headlines(self.snapshot.as_ref(), self.selected, &self.query),
-                String::new(),
+                palette.clone(),
                 g.headlines,
                 base.clone(),
             );
         } else {
-            self.surfaces[1] = None;
-            self.surfaces[2] = None;
+            self.clear_surface(1);
+            self.clear_surface(2);
         }
         let article_base = self
             .article
@@ -322,7 +524,7 @@ impl App {
             .unwrap_or(base.clone());
         self.set_surface(
             3,
-            ui::article_html(self.article.as_ref(), self.full, &self.decora),
+            ui::article_html(self.article.as_ref(), self.full_article.show, &self.decora),
             ui::article_css(&self.settings),
             g.article,
             article_base,
@@ -348,12 +550,12 @@ impl App {
             self.set_surface(
                 4,
                 html,
-                format!(".dialog{{min-height:{height}px}}"),
+                format!("{palette}.dialog{{min-height:{height}px}}"),
                 rect,
                 base,
             );
         } else {
-            self.surfaces[4] = None;
+            self.clear_surface(4);
         }
         self.dirty = false;
     }
@@ -361,15 +563,19 @@ impl App {
         if self.dirty {
             self.rebuild();
         }
-        let mut scene = empty_scene(self.metrics, self.store.clone());
+        let theme = Theme::from_name(&self.settings.reading_theme);
+        let mut scene = empty_scene(self.metrics, self.store.clone(), theme);
         let seconds = self.started.elapsed().as_secs_f32();
         for index in 0..5 {
             let Some(surface) = &mut self.surfaces[index] else {
                 continue;
             };
-            if index == 1 {
-                ui::focus_feed_actions(
-                    &mut surface.doc,
+            if index == 1
+                && self.requests[1]
+                    .as_ref()
+                    .is_some_and(|r| r.generation == surface.generation)
+            {
+                self.documents[1].focus(
                     self.focus_target
                         .filter(|(i, _)| *i == 1 && self.keyboard_focus && self.dialog.is_none())
                         .map(|(_, node)| node),
@@ -378,12 +584,23 @@ impl App {
             if index == 4 {
                 scene.primitives.push(Paint::FillRect {
                     rect: CssRect::new(0.0, 0.0, self.geometry.width, self.geometry.height),
-                    color: PaintColor::Rgba(75, 22, 49, 135),
+                    color: theme.paint("overlay", 155),
                 });
             }
-            let mut part = surface
-                .doc
-                .scene(self.metrics, surface.rect, surface.scroll, seconds);
+            if surface
+                .cached
+                .as_ref()
+                .is_none_or(|(rect, scroll, _)| *rect != surface.rect || *scroll != surface.scroll)
+            {
+                surface.cached = Some((
+                    surface.rect,
+                    surface.scroll,
+                    surface
+                        .doc
+                        .scene(self.metrics, surface.rect, surface.scroll, seconds),
+                ));
+            }
+            let mut part = surface.cached.as_ref().unwrap().2.clone();
             if index == 0 || index == 1 || (index == 3 && self.article.is_none()) {
                 self.decora.animate(
                     &mut part,
@@ -398,24 +615,37 @@ impl App {
                 for rect in part.selection_rects(selection) {
                     part.primitives.push(Paint::FillRect {
                         rect,
-                        color: PaintColor::Rgba(217, 95, 153, 75),
+                        color: theme.paint("accent", 65),
                     });
                 }
             }
-            if index == 3 && !self.find.is_empty() {
-                let matches = part.find_text(&self.find);
-                for (i, selection) in matches.iter().enumerate() {
-                    for rect in part.selection_rects(*selection) {
+            if index == 3 && !self.find.is_empty() && self.find_highlights.query == self.find {
+                part.primitives
+                    .push(Paint::PushClip(trust::render::PaintShape::Rect(
+                        surface.rect,
+                    )));
+                for (i, rectangles) in self.find_highlights.matches.iter().enumerate() {
+                    for rectangle in rectangles {
+                        let rect = rectangle.translate(
+                            surface.rect.x - surface.scroll.x,
+                            surface.rect.y - surface.scroll.y,
+                        );
+                        if rect.y + rect.height < surface.rect.y
+                            || rect.y > surface.rect.y + surface.rect.height
+                        {
+                            continue;
+                        }
                         part.primitives.push(Paint::FillRect {
                             rect,
                             color: if i == self.find_index {
-                                PaintColor::Rgba(240, 157, 46, 135)
+                                theme.paint("find", 110)
                             } else {
-                                PaintColor::Rgba(249, 211, 98, 70)
+                                theme.paint("find-soft", 60)
                             },
                         });
                     }
                 }
+                part.primitives.push(Paint::PopClip);
             }
             if let Some((fi, node)) = self.focus_target
                 && self.keyboard_focus
@@ -423,6 +653,24 @@ impl App {
                 && let Some(rect) = node_rect(surface, node)
             {
                 // Keyboard-only underline, never an arbitrary clicked box.
+                let mut ancestor = Some(node);
+                let mut focus_color = theme.paint("accent", 255);
+                while let Some(current) = ancestor {
+                    if surface
+                        .doc
+                        .dom
+                        .attr(current, "class")
+                        .is_some_and(|classes| {
+                            classes
+                                .split_ascii_whitespace()
+                                .any(|class| matches!(class, "primary" | "ribbon" | "dialog-top"))
+                        })
+                    {
+                        focus_color = theme.paint("primary-ink", 255);
+                        break;
+                    }
+                    ancestor = surface.doc.dom.node(current).parent;
+                }
                 part.primitives.push(Paint::FillRect {
                     rect: CssRect::new(
                         rect.x + 3.0,
@@ -430,7 +678,7 @@ impl App {
                         (rect.width - 6.0).max(1.0),
                         2.0,
                     ),
-                    color: PaintColor::Rgba(190, 40, 105, 230),
+                    color: focus_color,
                 });
             }
             if index == 4 {
@@ -467,7 +715,7 @@ impl App {
                             &mut part.primitives,
                             &visual,
                             rect,
-                            PaintColor::Rgba(78, 36, 61, 255),
+                            theme.paint("ink", 255),
                         );
                     }
                 }
@@ -507,7 +755,7 @@ impl App {
                     };
                     part.primitives.push(Paint::FillRect {
                         rect,
-                        color: PaintColor::Rgba(183, 90, 137, 160),
+                        color: theme.paint("accent", 180),
                     });
                 }
             }
@@ -531,6 +779,12 @@ impl App {
             return;
         }
         let scene = self.compose();
+        if self.surfaces[3]
+            .as_ref()
+            .is_some_and(|s| self.image_scroll != Some((s.generation, s.scroll)))
+        {
+            self.schedule_images();
+        }
         if let Some(presenter) = &mut self.presenter
             && let Err(error) = presenter.present(&scene)
         {
@@ -550,20 +804,60 @@ impl App {
         self.update_accessibility();
     }
     fn schedule_images(&mut self) {
-        let Some(id) = self.selected else { return };
+        if self.selected.is_none() || self.article.is_none() || !self.current_surface(3) {
+            return;
+        }
+        if self.requests[3].as_ref().is_some_and(|r| r.failed) {
+            return;
+        }
         let Some(surface) = &self.surfaces[3] else {
             return;
         };
-        let sources = surface
+        self.image_scroll = Some((surface.generation, surface.scroll));
+        let top = surface.scroll.y;
+        let bottom = top + surface.rect.height;
+        let distances: HashMap<_, _> = surface
+            .doc
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|paint| {
+                if let Paint::Image { handle, rect, .. } = paint {
+                    let distance = if rect.y + rect.height < top {
+                        top - rect.y - rect.height
+                    } else if rect.y > bottom {
+                        rect.y - bottom
+                    } else {
+                        0.0
+                    };
+                    Some((*handle, distance))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let sink = self.documents[3].images();
+        let mut requests: Vec<_> = surface
             .doc
             .image_requests()
             .iter()
             .filter(|r| !r.source.starts_with(ui::ASSET_BASE) && !r.source.starts_with("data:"))
+            .filter(|r| !surface.doc.resources.contains(r.handle))
+            .filter(|r| sink.reserve(&r.source, distances.get(&r.handle) == Some(&0.0)))
+            .collect();
+        requests.sort_by(|a, b| {
+            distances
+                .get(&a.handle)
+                .unwrap_or(&f32::MAX)
+                .total_cmp(distances.get(&b.handle).unwrap_or(&f32::MAX))
+        });
+        let sources = requests
+            .into_iter()
             .map(|r| r.source.clone())
-            .filter(|s| self.images.insert(s.clone()))
             .collect::<Vec<_>>();
         if !sources.is_empty() {
-            self.backend.images(id, sources);
+            self.backend.images(sink, sources);
         }
     }
     fn select(&mut self, id: i64) {
@@ -573,23 +867,44 @@ impl App {
             return;
         }
         self.persist_scroll();
+        self.full_article.select();
+        self.article_serial += 1;
         self.selected = Some(id);
         self.manually_unread = None;
         self.article = None;
         self.read_since = None;
         self.selection = None;
-        self.images.clear();
+        self.image_scroll = None;
         self.find.clear();
-        self.surfaces[3] = None;
-        self.backend.article(id);
+        self.find_highlights = FindHighlights::default();
+        self.find_pending = None;
+        self.article_scroll = None;
+        self.clear_surface(3);
+        self.backend.article(id, self.article_serial);
         self.dirty = true;
         self.redraw();
+    }
+    fn fetch_full_article(&mut self, manual: bool) {
+        let Some(article) = &self.article else {
+            return;
+        };
+        if self
+            .full_article
+            .request(article, manual, |id, url, serial| {
+                self.backend.extract(id, url, serial)
+            })
+        {
+            self.message("Retrieving the full article…");
+        }
+        if manual {
+            self.dirty = true;
+        }
     }
     fn choose_view(&mut self, view: View) {
         self.persist_scroll();
         self.query.view = view;
         self.query.offset = 0;
-        self.surfaces[2] = None;
+        self.clear_surface(2);
         self.reload();
     }
     fn next_article(&mut self, delta: isize) {
@@ -609,11 +924,24 @@ impl App {
             }
         }
     }
+    fn mouse_navigation(&mut self, button: MouseButton, state: ElementState) {
+        if state != ElementState::Pressed || self.dialog.is_some() || self.editor.is_some() {
+            return;
+        }
+        let Some(delta) = (match button {
+            MouseButton::Back => Some(1),
+            MouseButton::Forward => Some(-1),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.next_article(delta);
+    }
     fn open_dialog(&mut self, dialog: Dialog, fields: Vec<(String, String)>) {
         self.commit_editor();
         self.dialog = Some(dialog);
         self.fields = fields;
-        self.surfaces[4] = None;
+        self.clear_surface(4);
         self.focus_target = None;
         self.selection = None;
         self.dirty = true;
@@ -665,7 +993,7 @@ impl App {
         self.commit_editor();
         self.dialog = None;
         self.fields.clear();
-        self.surfaces[4] = None;
+        self.clear_surface(4);
         self.focus_target = None;
         self.dirty = true;
         if let Some(w) = &self.window {
@@ -712,6 +1040,7 @@ impl App {
     }
     /// Exercise the real retained hit test, not an action-only shortcut.
     fn smoke_click(&mut self, action: &str, event_loop: &ActiveEventLoop) {
+        self.smoke_settle_documents();
         if self.dirty {
             self.rebuild();
         }
@@ -751,6 +1080,7 @@ impl App {
         self.activate(index, node, event_loop);
     }
     fn smoke_capture(&mut self, name: &str) {
+        self.smoke_settle_documents();
         let scene = self.compose();
         let frame = trust::render::vello_cpu::VelloCpuRenderer::new()
             .render_rgba(&scene)
@@ -758,12 +1088,42 @@ impl App {
         let path = self.backend.data_dir.join(format!("smoke-{name}.png"));
         trust::render::headless::write_png(&frame, &path).expect("Smoke screenshot");
     }
+    /// Only the scripted acceptance driver waits for a specific document state;
+    /// production input/rendering never waits on a document worker.
+    fn smoke_settle_documents(&mut self) {
+        assert!(self.smoke);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.dirty {
+                self.rebuild();
+            }
+            self.documents[1].focus(
+                self.focus_target
+                    .filter(|(i, _)| *i == 1 && self.keyboard_focus && self.dialog.is_none())
+                    .map(|(_, node)| node),
+            );
+            for index in 0..5 {
+                self.document_ready(index);
+            }
+            if self.documents.iter().all(DocumentWorker::idle) && !self.dirty {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Smoke: document preparation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
-fn empty_scene(metrics: ViewportMetrics, store: ImageStore) -> Scene {
+fn empty_scene(metrics: ViewportMetrics, store: ImageStore, theme: Theme) -> Scene {
     Scene {
         viewport: metrics,
-        primitives: vec![],
+        primitives: vec![Paint::FillRect {
+            rect: CssRect::new(0.0, 0.0, metrics.css.width, metrics.css.height),
+            color: theme.paint("canvas", 255),
+        }],
         controls: vec![],
         content_viewport: CssRect::new(0.0, 0.0, metrics.css.width, metrics.css.height),
         image_store: store,
@@ -959,10 +1319,7 @@ impl App {
                 }
             }
             "extract" => {
-                if let Some(a) = &self.article {
-                    self.backend.extract(a.id, a.url.clone());
-                    self.message("Retrieving the full article…");
-                }
+                self.fetch_full_article(true);
             }
             "original" => {
                 if let Some(a) = &self.article {
@@ -970,7 +1327,12 @@ impl App {
                 }
             }
             "source" => {
-                self.full = !self.full;
+                self.full_article.show = !self.full_article.show;
+                if self.full_article.show
+                    && self.article.as_ref().is_some_and(|a| a.extracted.is_none())
+                {
+                    self.fetch_full_article(true);
+                }
                 self.dirty = true;
             }
             "focus" => {
@@ -1048,13 +1410,13 @@ impl App {
                     Sort::Feed => Sort::Newest,
                 };
                 self.query.offset = 0;
-                self.surfaces[2] = None;
+                self.clear_surface(2);
                 self.message(format!("Sort: {:?}", self.query.sort));
                 self.reload();
             }
             "page-prev" => {
                 self.query.offset = self.query.offset.saturating_sub(150);
-                self.surfaces[2] = None;
+                self.clear_surface(2);
                 self.reload();
             }
             "page-next" => {
@@ -1064,7 +1426,7 @@ impl App {
                     .is_some_and(|s| (self.query.offset + 150) < s.total as usize)
                 {
                     self.query.offset += 150;
-                    self.surfaces[2] = None;
+                    self.clear_surface(2);
                     self.reload();
                 }
             }
@@ -1082,6 +1444,9 @@ impl App {
     }
     fn settings_changed(&mut self) {
         if let Some(window) = &self.window {
+            window.set_theme(Some(
+                Theme::from_name(&self.settings.reading_theme).window_theme(),
+            ));
             window.set_min_inner_size(Some(LogicalSize::new(
                 860.0 * self.settings.ui_scale as f64,
                 650.0 * self.settings.ui_scale as f64,
@@ -1162,6 +1527,7 @@ impl App {
                 }
                 self.selected = None;
                 self.article = None;
+                self.full_article.select();
             }
             Dialog::DeleteFolder(id) => {
                 self.backend.change(move |db| {
@@ -1176,7 +1542,7 @@ impl App {
             Dialog::Search => {
                 self.query.search = values.first().cloned().unwrap_or_default();
                 self.query.offset = 0;
-                self.surfaces[2] = None;
+                self.clear_surface(2);
                 self.close_dialog();
                 self.reload();
             }
@@ -1225,32 +1591,33 @@ impl App {
         });
     }
     fn jump_find(&mut self, next: bool) {
-        if let Some(surface) = &mut self.surfaces[3] {
-            let scene = surface
-                .doc
-                .scene(self.metrics, surface.rect, CssPoint::default(), 0.0);
-            let matches = scene.find_text(&self.find);
-            if matches.is_empty() {
-                self.message("No matching text in this article");
-                return;
-            }
-            if next {
-                self.find_index = (self.find_index + 1) % matches.len();
-            } else {
-                self.find_index = 0;
-            }
-            if let Some(rect) = scene.selection_rects(matches[self.find_index]).first() {
-                surface.scroll = surface.doc.clamp_scroll(CssPoint::new(
-                    surface.scroll.x,
-                    (rect.y - surface.rect.y - 40.0).max(0.0),
-                ));
-            }
-            self.message(format!(
-                "Match {} of {}",
-                self.find_index + 1,
-                matches.len()
-            ));
+        if self.find_highlights.query != self.find {
+            self.find_pending = Some(next);
+            self.documents[3].find(self.find.clone());
+            return;
         }
+        let matches = &self.find_highlights.matches;
+        if matches.is_empty() {
+            self.message("No matching text in this article");
+            return;
+        }
+        self.find_index = if next {
+            (self.find_index + 1) % matches.len()
+        } else {
+            0
+        };
+        if let Some(surface) = &mut self.surfaces[3]
+            && let Some(rect) = matches[self.find_index].first()
+        {
+            surface.scroll = surface
+                .doc
+                .clamp_scroll(CssPoint::new(surface.scroll.x, (rect.y - 40.0).max(0.0)));
+        }
+        self.message(format!(
+            "Match {} of {}",
+            self.find_index + 1,
+            matches.len()
+        ));
     }
     fn ancestor_attr(&self, index: usize, node: usize, name: &str) -> Option<String> {
         self.surfaces[index]
@@ -1269,13 +1636,17 @@ impl App {
         }
     }
     fn charm_hit(&self, point: CssPoint) -> Option<crate::decora::CharmHit> {
+        self.charm_hit_with_target(point, self.hit(point))
+    }
+    fn charm_hit_with_target(
+        &self,
+        point: CssPoint,
+        target: Option<(usize, usize)>,
+    ) -> Option<crate::decora::CharmHit> {
         if self.dialog.is_some() {
             return None;
         }
-        if self
-            .hit(point)
-            .is_some_and(|(i, node)| self.interactive_target(i, node).is_some())
-        {
+        if target.is_some_and(|(i, node)| self.interactive_target(i, node).is_some()) {
             return None; // Functional controls always take priority.
         }
         for i in (0..4).rev() {
@@ -1296,6 +1667,7 @@ impl App {
                 continue;
             }
             if let Some(s) = &self.surfaces[i]
+                && (i != 3 || self.current_surface(i))
                 && s.rect.contains(point)
                 && let Some(hit) = s.doc.hit(
                     CssPoint::new(point.x - s.rect.x, point.y - s.rect.y),
@@ -1308,6 +1680,16 @@ impl App {
         None
     }
     fn activate(&mut self, index: usize, node: usize, event_loop: &ActiveEventLoop) {
+        // App controls dispatch the trusted href in the visible snapshot,
+        // including while a new status/layout is being prepared. Only article
+        // mutations require node IDs from the current document generation.
+        if (index == 3 && !self.current_surface(index))
+            || !self.surfaces[index]
+                .as_ref()
+                .is_some_and(|s| s.doc.dom.is_valid(node))
+        {
+            return;
+        }
         if index == 3 {
             if self.article.is_none() {
                 return;
@@ -1351,11 +1733,8 @@ impl App {
                 platform::open_url(&href);
             } else if let Some(src) = self.ancestor_attr(index, node, "src") {
                 self.open_dialog(Dialog::Image(src), vec![]);
-            } else if let Some(surface) = &mut self.surfaces[3]
-                && ui::toggle_disclosure(&mut surface.doc, node)
-            {
-                surface.scroll = surface.doc.clamp_scroll(surface.scroll);
-                self.redraw();
+            } else {
+                self.documents[3].toggle(node);
             }
         } else if let Some(href) = self.ancestor_attr(index, node, "href")
             && let Some(action) = href.strip_prefix("app:")
@@ -1395,6 +1774,8 @@ impl App {
                 dx -= next.x - c.offset.x;
                 dy -= next.y - c.offset.y;
                 c.offset = next;
+                s.cached = None;
+                self.documents[index].scroll(c.node, next);
             }
             s.scroll = s
                 .doc
@@ -1406,6 +1787,9 @@ impl App {
         let mut targets = Vec::new();
         for i in 0..5 {
             if self.dialog.is_some() && i != 4 {
+                continue;
+            }
+            if i == 3 && !self.current_surface(i) {
                 continue;
             }
             if let Some(surface) = &self.surfaces[i] {
@@ -1680,6 +2064,10 @@ fn translate_key(key: &NativeKey) -> Key {
 impl App {
     fn update_accessibility(&mut self) {
         use accesskit::{Action, Node, NodeId, Rect, Role, Tree, TreeUpdate};
+        if !self.accessibility_dirty {
+            return;
+        }
+        self.accessibility_dirty = false;
         let Some(mut adapter) = self.accessibility.take() else {
             return;
         };
@@ -1697,9 +2085,12 @@ impl App {
                 let Some(surface) = &self.surfaces[i] else {
                     continue;
                 };
-                let semantics = surface.doc.semantics(None);
+                let Some(semantics) = &surface.doc.semantics else {
+                    self.documents[i].request_semantics();
+                    continue;
+                };
                 let offset = (i as u64 + 1) * 1_000_000;
-                for semantic in semantics.nodes {
+                for semantic in &semantics.nodes {
                     let sid = NodeId(offset + semantic.id);
                     let role = match semantic.role {
                         trust::accessibility::Role::Heading => Role::Heading,
@@ -1716,7 +2107,7 @@ impl App {
                     };
                     let mut node = Node::new(role);
                     if !semantic.name.is_empty() {
-                        node.set_label(semantic.name);
+                        node.set_label(semantic.name.as_str());
                     }
                     let r = semantic.bounds;
                     node.set_bounds(Rect::new(
@@ -1750,7 +2141,7 @@ impl App {
                     node.set_children(
                         semantic
                             .children
-                            .into_iter()
+                            .iter()
                             .map(|id| NodeId(offset + id))
                             .collect::<Vec<_>>(),
                     );
@@ -1770,6 +2161,11 @@ impl App {
                     )
                 })
                 .unwrap_or(NodeId(0));
+            let focus = if nodes.iter().any(|(id, _)| *id == focus) {
+                focus
+            } else {
+                NodeId(0)
+            };
             TreeUpdate {
                 nodes,
                 tree: Some(Tree::new(NodeId(0))),
@@ -1780,6 +2176,7 @@ impl App {
         self.accessibility = Some(adapter);
     }
     fn pointer_move(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        self.pending_pointer = None;
         self.pointer = self.metrics.physical_to_css(position.x, position.y);
         if let Some(drag) = self.drag {
             if drag == 0 {
@@ -1815,12 +2212,11 @@ impl App {
             self.redraw();
         }
         let hit = self.hit(self.pointer);
-        let mut hover_changed = false;
         for i in 0..5 {
-            if let Some(s) = &mut self.surfaces[i] {
+            if self.surfaces[i].is_some() {
                 let target = hit.filter(|(index, _)| *index == i).map(|(_, node)| node);
-                if i != 3 {
-                    hover_changed |= s.doc.hover(target);
+                if i != 3 && self.current_surface(i) {
+                    self.documents[i].hover(target);
                 }
             }
         }
@@ -1834,7 +2230,7 @@ impl App {
             && self.geometry.horizontal.contains(self.pointer)
         {
             CursorIcon::RowResize
-        } else if self.charm_hit(self.pointer).is_some()
+        } else if self.charm_hit_with_target(self.pointer, hit).is_some()
             || hit.is_some_and(|(i, node)| self.ancestor_attr(i, node, "href").is_some())
         {
             CursorIcon::Pointer
@@ -1846,11 +2242,11 @@ impl App {
         if let Some(w) = &self.window {
             w.set_cursor(cursor);
         }
-        if hover_changed {
-            self.redraw();
-        }
     }
     fn mouse(&mut self, state: ElementState, event_loop: &ActiveEventLoop) {
+        if let Some(position) = self.pending_pointer.take() {
+            self.pointer_move(position);
+        }
         if state == ElementState::Pressed {
             self.keyboard_focus = false;
             self.mouse_down = true;
@@ -1964,6 +2360,9 @@ impl App {
         };
         let attributes = Window::default_attributes()
             .with_title(title)
+            .with_theme(Some(
+                Theme::from_name(&self.settings.reading_theme).window_theme(),
+            ))
             .with_inner_size(LogicalSize::new(
                 self.settings.window_width,
                 self.settings.window_height,
@@ -2020,6 +2419,9 @@ impl App {
         self.occluded = false;
         self.dirty = true;
         self.metrics_for_window();
+        for document in &self.documents {
+            document.restore_assets();
+        }
         window.set_ime_allowed(self.editor.is_some());
         window.set_visible(true);
         self.redraw();
@@ -2068,8 +2470,8 @@ impl ApplicationHandler<Event> for App {
                     Err(e) => self.message(e),
                 }
             }
-            Event::Article(id, result) => {
-                if self.selected != Some(id) {
+            Event::Article(id, serial, result) => {
+                if self.selected != Some(id) || self.article_serial != serial {
                     return;
                 }
                 match result {
@@ -2078,13 +2480,25 @@ impl ApplicationHandler<Event> for App {
                         self.article = Some(article);
                         self.read_since = None;
                         self.dirty = true;
+                        self.article_scroll = Some(CssPoint::new(0.0, scroll));
+                        self.fetch_full_article(false);
                         self.rebuild();
-                        if let Some(s) = &mut self.surfaces[3] {
-                            s.scroll = s.doc.clamp_scroll(CssPoint::new(0.0, scroll));
-                        }
-                        self.schedule_images();
                     }
                     Err(e) => self.message(e),
+                }
+            }
+            Event::Extracted(id, serial, result) => {
+                if !self.full_article.complete(id, serial) || self.selected != Some(id) {
+                    return;
+                }
+                match result {
+                    Ok(html) => {
+                        if let Some(article) = &mut self.article {
+                            article.extracted = Some(html);
+                        }
+                        self.message("Full article retrieved");
+                    }
+                    Err(e) => self.message(format!("Couldn’t load the full article: {e}")),
                 }
             }
             Event::Changed(result) => {
@@ -2133,18 +2547,7 @@ impl ApplicationHandler<Event> for App {
                 }
                 self.reload();
             }
-            Event::Image {
-                i64_id,
-                source,
-                bytes,
-            } => {
-                if self.selected == Some(i64_id)
-                    && let Ok(image) = trust::img::decode_graphical(&bytes)
-                    && let Some(s) = &mut self.surfaces[3]
-                {
-                    s.doc.supply_image(&source, image);
-                }
-            }
+            Event::DocumentReady(index) => self.document_ready(index),
             Event::Open => self.show(event_loop),
             Event::Quit => self.action("quit", event_loop),
             Event::Refresh => self.action("refresh", event_loop),
@@ -2163,6 +2566,7 @@ impl ApplicationHandler<Event> for App {
             {
                 match event.window_event {
                     accesskit_winit::WindowEvent::InitialTreeRequested => {
+                        self.accessibility_dirty = true;
                         self.update_accessibility()
                     }
                     accesskit_winit::WindowEvent::ActionRequested(request) => {
@@ -2217,6 +2621,12 @@ impl ApplicationHandler<Event> for App {
         if let (Some(adapter), Some(window)) = (&mut self.accessibility, &self.window) {
             adapter.process_event(window, &event);
         }
+        if !matches!(
+            &event,
+            WindowEvent::RedrawRequested | WindowEvent::CursorMoved { .. }
+        ) {
+            self.accessibility_dirty = true;
+        }
         match event {
             WindowEvent::CloseRequested => self.close_window(),
             WindowEvent::RedrawRequested => self.render(),
@@ -2245,10 +2655,15 @@ impl ApplicationHandler<Event> for App {
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            WindowEvent::CursorMoved { position, .. } => self.pointer_move(position),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = self.metrics.physical_to_css(position.x, position.y);
+                self.pending_pointer = Some(position);
+            }
             WindowEvent::CursorLeft { .. } => {
-                for surface in self.surfaces.iter_mut().flatten() {
-                    surface.doc.hover(None);
+                self.pending_pointer = None;
+                self.pointer = CssPoint::new(-1.0, -1.0);
+                for document in &self.documents {
+                    document.hover(None);
                 }
                 self.redraw();
             }
@@ -2257,6 +2672,7 @@ impl ApplicationHandler<Event> for App {
                 button: MouseButton::Left,
                 ..
             } => self.mouse(state, event_loop),
+            WindowEvent::MouseInput { state, button, .. } => self.mouse_navigation(button, state),
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-x * 36.0, -y * 36.0),
@@ -2288,6 +2704,12 @@ impl ApplicationHandler<Event> for App {
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if self.last_pointer.elapsed() >= Duration::from_millis(16)
+            && let Some(position) = self.pending_pointer.take()
+        {
+            self.pointer_move(position);
+            self.last_pointer = now;
+        }
         if self.last_refresh.elapsed() >= Duration::from_secs(60) {
             self.backend.refresh(None, true);
             self.last_refresh = now;
@@ -2297,6 +2719,8 @@ impl ApplicationHandler<Event> for App {
             && self.focused
             && self.dialog.is_none()
             && self.manually_unread != self.selected
+            && self.current_surface(3)
+            && self.requests[3].as_ref().is_none_or(|r| !r.failed)
             && self.article.as_ref().is_some_and(|a| !a.read);
         if can_read {
             if let Some(since) = self.read_since {
@@ -2340,6 +2764,11 @@ impl ApplicationHandler<Event> for App {
                     .max(Duration::from_millis(100))
             }
         };
+        let delay = if self.pending_pointer.is_some() {
+            delay.min(Duration::from_millis(16).saturating_sub(self.last_pointer.elapsed()))
+        } else {
+            delay
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(now + delay));
         if self.smoke && self.smoke_time.elapsed() > Duration::from_secs(2) {
             match self.smoke_step {
@@ -2373,14 +2802,7 @@ impl ApplicationHandler<Event> for App {
                         })
                         .unwrap();
                     let actions = surface.doc.dom.node(edit).parent.unwrap();
-                    assert_eq!(
-                        surface
-                            .doc
-                            .dom
-                            .computed_value(actions, "opacity")
-                            .as_deref(),
-                        Some("0")
-                    );
+                    assert_eq!(surface.doc.dom.node(actions).opacity, 0.0);
                     let feed_rect = node_rect(surface, feed).unwrap();
                     let scale = self.metrics.scale_factor.get();
                     self.pointer_move(PhysicalPosition::new(
@@ -2389,14 +2811,7 @@ impl ApplicationHandler<Event> for App {
                     ));
                     self.smoke_capture("feed-hover");
                     let surface = self.surfaces[1].as_ref().unwrap();
-                    assert_eq!(
-                        surface
-                            .doc
-                            .dom
-                            .computed_value(actions, "opacity")
-                            .as_deref(),
-                        Some("1")
-                    );
+                    assert_eq!(surface.doc.dom.node(actions).opacity, 1.0);
                     let edit_rect = node_rect(surface, edit).unwrap();
                     self.pointer_move(PhysicalPosition::new(
                         (edit_rect.x + edit_rect.width * 0.5) as f64 * scale,
@@ -2412,6 +2827,7 @@ impl ApplicationHandler<Event> for App {
                     self.pointer_move(PhysicalPosition::new(420.0 * scale, 105.0 * scale));
                     self.focus_target = Some((1, feed));
                     self.focus_next(false);
+                    self.smoke_settle_documents();
                     self.compose();
                     assert_eq!(
                         self.focus_target,
@@ -2424,13 +2840,14 @@ impl ApplicationHandler<Event> for App {
                             .unwrap()
                             .doc
                             .dom
-                            .computed_value(actions, "opacity")
-                            .as_deref(),
-                        Some("1")
+                            .node(actions)
+                            .opacity,
+                        1.0
                     );
                     self.smoke_capture("feed-keyboard");
                     self.focus_target = None;
                     self.keyboard_focus = false;
+                    self.smoke_settle_documents();
                     self.compose();
                     assert_eq!(
                         self.surfaces[1]
@@ -2438,14 +2855,14 @@ impl ApplicationHandler<Event> for App {
                             .unwrap()
                             .doc
                             .dom
-                            .computed_value(actions, "opacity")
-                            .as_deref(),
-                        Some("0")
+                            .node(actions)
+                            .opacity,
+                        0.0
                     );
                     // Actual pointer path: blank decoration cannot become a
                     // focus box, and a visible charm is a local fidget, not a
                     // link, article selection, or image enlargement.
-                    self.pointer = CssPoint::new(420.0, 105.0);
+                    self.pointer_move(PhysicalPosition::new(420.0 * scale, 105.0 * scale));
                     self.mouse(ElementState::Pressed, event_loop);
                     self.mouse(ElementState::Released, event_loop);
                     assert!(self.focus_target.is_none());
@@ -2458,7 +2875,10 @@ impl ApplicationHandler<Event> for App {
                             .find(|n| surface.doc.dom.attr(*n, "class") == Some(class))
                             .unwrap();
                         let rect = node_rect(surface, node).unwrap();
-                        self.pointer = CssPoint::new(rect.x + 3.0, rect.y + 3.0);
+                        self.pointer_move(PhysicalPosition::new(
+                            (rect.x + 3.0) as f64 * scale,
+                            (rect.y + 3.0) as f64 * scale,
+                        ));
                         self.mouse(ElementState::Pressed, event_loop);
                         self.mouse(ElementState::Released, event_loop);
                         assert!(
@@ -2476,7 +2896,10 @@ impl ApplicationHandler<Event> for App {
                         })
                         .find(|p| self.charm_hit(*p).is_some())
                         .expect("Smoke: visible charm pixels");
-                    self.pointer = point;
+                    self.pointer_move(PhysicalPosition::new(
+                        point.x as f64 * scale,
+                        point.y as f64 * scale,
+                    ));
                     self.mouse(ElementState::Pressed, event_loop);
                     self.mouse(ElementState::Released, event_loop);
                     assert!(self.decora.active(self.started.elapsed().as_secs_f32()));
@@ -2502,11 +2925,48 @@ impl ApplicationHandler<Event> for App {
                 }
                 2 => {
                     assert!(matches!(self.dialog, Some(Dialog::Settings)));
-                    self.smoke_click("theme", event_loop);
-                    self.smoke_capture("settings");
+                    let selected = self.selected;
+                    let scroll = self.surfaces[3].as_ref().unwrap().scroll;
+                    // Exercise both palettes through the real settings control,
+                    // including every live document and the modal itself.
+                    for theme in ["sepia", "dark", "light", "sepia"] {
+                        let generations: Vec<_> = self
+                            .surfaces
+                            .iter()
+                            .map(|s| s.as_ref().unwrap().generation)
+                            .collect();
+                        self.smoke_click("theme", event_loop);
+                        assert_eq!(self.settings.reading_theme, theme);
+                        self.smoke_capture(&format!("settings-{theme}"));
+                        for (i, before) in generations.into_iter().enumerate() {
+                            assert!(self.current_surface(i));
+                            assert_ne!(
+                                self.surfaces[i].as_ref().unwrap().generation,
+                                before,
+                                "Theme changes must reach surface {i}"
+                            );
+                        }
+                        assert_eq!(self.selected, selected);
+                        assert_eq!(self.surfaces[3].as_ref().unwrap().scroll, scroll);
+                        assert!(matches!(self.dialog, Some(Dialog::Settings)));
+                    }
                     self.smoke_click("cancel", event_loop);
+                    self.smoke_capture("sepia");
                 }
-                3 => self.smoke_click("add", event_loop),
+                3 => {
+                    assert_eq!(
+                        self.backend
+                            .store
+                            .lock()
+                            .unwrap()
+                            .settings()
+                            .unwrap()
+                            .reading_theme,
+                        "sepia",
+                        "App theme persists through the storage worker"
+                    );
+                    self.smoke_click("add", event_loop);
+                }
                 4 => {
                     let (_, editor) = self.editor.as_mut().expect("Smoke: field focused");
                     editor.replace_selection("https://example.test/feed?label=花&note=café");
@@ -2578,10 +3038,23 @@ impl ApplicationHandler<Event> for App {
                         "Smoke: full-text search"
                     );
                     self.query.search.clear();
-                    self.settings.reading_theme = "dark".into();
+                    self.focus_mode = false;
                     self.settings.reduced_motion = true;
                     self.dirty = true;
+                    self.smoke_click("theme", event_loop);
+                    assert_eq!(self.settings.reading_theme, "dark");
                     self.smoke_capture("dark");
+                    self.smoke_click("settings", event_loop);
+                    self.smoke_capture("dark-settings");
+                    self.smoke_click("cancel", event_loop);
+                    self.smoke_click("add", event_loop);
+                    let (_, editor) = self.editor.as_mut().expect("Smoke: dark field focused");
+                    editor.replace_selection("https://example.test/feed?label=花&note=café");
+                    self.smoke_capture("dark-field");
+                    self.smoke_click("cancel", event_loop);
+                    self.smoke_click("focus", event_loop);
+                    self.smoke_capture("dark-focus");
+                    self.smoke_click("focus", event_loop);
                 }
                 11 => {
                     let sample = self
@@ -2595,7 +3068,8 @@ impl ApplicationHandler<Event> for App {
                         .into_iter()
                         .find(|a| a.title.contains("typography specimen"))
                         .expect("Smoke: rich article fixture");
-                    self.settings.reading_theme = "light".into();
+                    self.smoke_click("theme", event_loop);
+                    assert_eq!(self.settings.reading_theme, "light");
                     self.select(sample.id);
                 }
                 12 => {
@@ -2632,9 +3106,53 @@ impl ApplicationHandler<Event> for App {
                     surface.scroll = surface.doc.clamp_scroll(CssPoint::new(0.0, 250.0));
                     self.smoke_capture("typography");
                 }
+                13 => {
+                    let article = self.article.as_mut().unwrap();
+                    article.extracted = None;
+                    article.content = format!(
+                        "{}<p>Deep nesting fixture</p>{}",
+                        "<div>".repeat(2048),
+                        "</div>".repeat(2048)
+                    );
+                    self.dirty = true;
+                    self.redraw();
+                }
+                14 => {
+                    self.smoke_settle_documents();
+                    assert!(self.requests[3].as_ref().unwrap().failed);
+                    assert!(
+                        self.current_surface(3),
+                        "Rejected articles leave an explanatory reading surface"
+                    );
+                    self.smoke_capture("article-limit");
+                    let add = self.surfaces[0]
+                        .as_ref()
+                        .unwrap()
+                        .doc
+                        .dom
+                        .descendants(trust::dom::DOCUMENT)
+                        .find(|&n| {
+                            self.surfaces[0].as_ref().unwrap().doc.dom.attr(n, "href")
+                                == Some("app:add")
+                        })
+                        .unwrap();
+                    self.message("Smoke: controls stay active during document replacement");
+                    self.rebuild();
+                    assert!(!self.current_surface(0));
+                    self.activate(0, add, event_loop);
+                    assert!(matches!(self.dialog, Some(Dialog::AddFeed)));
+                    // Close/reopen before a frame has consumed the previous
+                    // request: the modal must still acquire a fresh document.
+                    self.action("cancel", event_loop);
+                    self.action("add", event_loop);
+                    self.smoke_settle_documents();
+                    assert!(self.current_surface(4));
+                    assert!(self.editor.is_some());
+                    self.smoke_click("cancel", event_loop);
+                }
                 _ => {
                     eprintln!(
-                        "Native smoke passed: rendered control hits, charm fidgets, no decorative focus boxes, article loading, Unicode editing, search, find, manual unread, saved persistence, themes, focus, tray close/reopen"
+                        "Native smoke passed: rendered control hits, charm fidgets, no decorative focus boxes, article loading, Unicode editing, search, find, manual unread, saved persistence, themes, focus, tray close/reopen, document limits, rapid modal replacement"
                     );
                     event_loop.exit();
                 }
@@ -2666,7 +3184,8 @@ pub fn snapshot(
     let g = Geometry::new(metrics, &settings, false);
     let store = ImageStore::default();
     let base = url::Url::parse("https://ruby-reader.invalid/")?;
-    let mut scene = empty_scene(metrics, store.clone());
+    let theme = Theme::from_name(&settings.reading_theme);
+    let mut scene = empty_scene(metrics, store.clone(), theme);
     let surfaces = [
         (
             ui::background(
@@ -2678,12 +3197,12 @@ pub fn snapshot(
                 false,
                 &decora,
             ),
-            String::new(),
+            theme.css(),
             CssRect::new(0.0, 0.0, g.width, g.height),
         ),
         (
             ui::sidebar(Some(&snap), &View::All, &decora),
-            String::new(),
+            theme.css(),
             g.sidebar,
         ),
         (
@@ -2692,7 +3211,7 @@ pub fn snapshot(
                 article.as_ref().map(|a| a.id),
                 &Query::default(),
             ),
-            String::new(),
+            theme.css(),
             g.headlines,
         ),
         (

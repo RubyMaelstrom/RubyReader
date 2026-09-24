@@ -14,10 +14,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 url = "2"
 
 [patch.crates-io]
+# Dependency patches are resolved at this workspace root, including the
+# matching active TRust renderer and its supporting local forks.
+glsl-lang-pp = { path = "../TRust/vendor/glsl-lang-pp-0.8.1" }
+vt100 = { path = "../TRust/vendor/vt100-0.16.2" }
+aes-gcm = { path = "../TRust/vendor/aes-gcm-0.11.1" }
+glifo = { path = "../TRust/vendor/glifo-0.3.0" }
 fontique = { path = "../TRust/vendor/fontique-0.11.1" }
 crossterm = { path = "../TRust/vendor/crossterm-0.29.0" }
 image-webp = { path = "../TRust/vendor/image-webp-0.2.4" }
 vello_hybrid = { path = "../TRust/vendor/vello_hybrid-0.2.0" }
+vello_common = { path = "../TRust/vendor/vello_common-0.2.0" }
+vello_cpu = { path = "../TRust/vendor/vello_cpu-0.2.0" }
+vello_sparse_shaders = { path = "../TRust/vendor/vello_sparse_shaders-0.2.0" }
 wasmi = { path = "../TRust/vendor/wasmi-1.1.0" }
 wasmi_core = { path = "../TRust/vendor/wasmi_core-1.1.0" }
 wasmi_ir = { path = "../TRust/vendor/wasmi_ir-1.1.0" }

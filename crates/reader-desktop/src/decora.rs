@@ -6,7 +6,7 @@ use std::{
 };
 use trust::{
     core::CssPoint,
-    embed::EmbeddedDocument,
+    embed::EmbeddedAttributes,
     render::{
         Affine2d, CssRect, DisplayCommand as Paint, ImageFit, ImageResource, PaintBrush,
         PaintColor, PaintShape, PathElement, Scene, StrokeStyle,
@@ -119,7 +119,7 @@ impl Decora {
 
     /// Hits the pixels actually presented, including native wiggles, CSS
     /// rotations, scroll and clipping. Transparent holes click through.
-    pub fn hit(scene: &Scene, doc: &EmbeddedDocument, point: CssPoint) -> Option<CharmHit> {
+    pub fn hit(scene: &Scene, doc: &impl EmbeddedAttributes, point: CssPoint) -> Option<CharmHit> {
         let mut transform = Affine2d::IDENTITY;
         let mut transforms = Vec::new();
         let mut clips = Vec::new();
@@ -152,8 +152,7 @@ impl Decora {
                     ..
                 } if clips.iter().all(|inside| *inside) => {
                     if let Some(name) = doc
-                        .dom
-                        .attr(*node, "data-charm")
+                        .attribute(*node, "data-charm")
                         .and_then(|name| ARTWORK.iter().find(|(id, _)| *id == name).map(|a| a.0))
                         && let Some(local) =
                             transform.inverse().map(|inverse| inverse.map_point(point))
@@ -172,7 +171,13 @@ impl Decora {
 
     /// Animate only explicitly marked, application-owned accessory images.
     /// A local display-list transform needs no layout invalidation or JS timer.
-    pub fn animate(&self, scene: &mut Scene, doc: &EmbeddedDocument, seconds: f32, reduced: bool) {
+    pub fn animate(
+        &self,
+        scene: &mut Scene,
+        doc: &impl EmbeddedAttributes,
+        seconds: f32,
+        reduced: bool,
+    ) {
         if reduced && !self.active(seconds) {
             return;
         }
@@ -180,8 +185,7 @@ impl Decora {
         for command in scene.primitives.drain(..) {
             let mut burst = None;
             let motion = if let Paint::Image { node, rect, .. } = &command {
-                doc.dom
-                    .attr(*node, "data-decora")
+                doc.attribute(*node, "data-decora")
                     .filter(|kind| !kind.is_empty())
                     .map(|kind| {
                         let t = seconds * 2.0 + *node as f32 * 1.7 + self.phase;
@@ -197,8 +201,7 @@ impl Decora {
                             angle = 0.0;
                         }
                         let age = doc
-                            .dom
-                            .attr(*node, "data-charm")
+                            .attribute(*node, "data-charm")
                             .and_then(|name| self.bursts.get(name))
                             .map(|start| seconds - start)
                             .filter(|age| (0.0..FIDGET_SECONDS).contains(age));

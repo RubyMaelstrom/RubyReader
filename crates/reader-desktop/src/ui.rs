@@ -1,4 +1,5 @@
 use crate::decora::{ARTWORK, Decora};
+use crate::theme::Theme;
 use reader_core::{content::escape as e, model::*};
 use trust::{
     core::{CssSize, ViewportMetrics},
@@ -506,20 +507,60 @@ pub fn document(
     size: CssSize,
     store: ImageStore,
 ) -> EmbeddedDocument {
-    let html = format!(
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'><style>{CSS}\n{extra}</style></head><body>{body}</body></html>"
-    );
-    let mut doc = EmbeddedDocument::new(&html, base, size, store);
+    let html = document_html(body, extra);
+    prepare_document(&html, base.clone(), size, store.clone()).unwrap_or_else(|message| {
+        EmbeddedDocument::new(
+            &document_html(&format!("<p>{}</p>", e(message)), extra),
+            base,
+            size,
+            store,
+        )
+    })
+}
+
+pub fn document_html(body: &str, extra: &str) -> String {
+    let palette = Theme::Light.css();
+    format!(
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'><style>{palette}\n{CSS}\n{extra}</style></head><body>{body}</body></html>"
+    )
+}
+
+pub fn prepare_document(
+    html: &str,
+    base: Url,
+    size: CssSize,
+    store: ImageStore,
+) -> Result<EmbeddedDocument, &'static str> {
+    let mut doc = EmbeddedDocument::try_new(
+        html,
+        base,
+        size,
+        store,
+        trust::embed::DocumentLimits {
+            bytes: 32 * 1024 * 1024,
+            nodes: 100_000,
+            depth: 512,
+        },
+    )?;
+    restore_assets(&mut doc);
+    Ok(doc)
+}
+
+/// A long article can evict artwork from the shared bounded image store while
+/// the window is in the tray. Restore the same collection on its owner thread.
+pub fn restore_assets(doc: &mut EmbeddedDocument) -> bool {
     let requests = doc.image_requests().to_vec();
+    let mut images = Vec::new();
     for request in requests {
-        if let Some(name) = request.source.strip_prefix(ASSET_BASE)
+        if !doc.resources.contains(request.handle)
+            && let Some(name) = request.source.strip_prefix(ASSET_BASE)
             && let Some(bytes) = asset_bytes(name)
             && let Ok(image) = trust::img::decode_graphical(bytes)
         {
-            doc.supply_image(&request.source, image);
+            images.push((request.source, image));
         }
     }
-    doc
+    doc.supply_images(images) != 0
 }
 
 pub fn asset_bytes(name: &str) -> Option<&'static [u8]> {
@@ -539,6 +580,8 @@ pub fn asset_bytes(name: &str) -> Option<&'static [u8]> {
         "rose.png" => include_bytes!("../../../assets/rose.png"),
         "icon.png" => include_bytes!("../../../assets/icon.png"),
         "gingham.svg" => include_bytes!("../../../assets/gingham.svg"),
+        "gingham-sepia.svg" => include_bytes!("../../../assets/gingham-sepia.svg"),
+        "gingham-dark.svg" => include_bytes!("../../../assets/gingham-dark.svg"),
         _ => return None,
     })
 }
@@ -568,7 +611,7 @@ pub fn background(
 ) -> String {
     let unread = snap.map_or(0, |s| s.unread);
     let title = view_name(&query.view, snap);
-    let mut out=format!("<img class='wallpaper' alt='' src='{ASSET_BASE}gingham.svg'><div class='topline'>♡ YOUR OWN LITTLE CORNER OF THE INTERNET ♡ <span style='float:right'>EST. 2026 · MADE WITH FEELING</span></div>
+    let mut out=String::from("<div class='wallpaper' aria-hidden='true'></div><div class='topline'>♡ YOUR OWN LITTLE CORNER OF THE INTERNET ♡ <span style='float:right'>EST. 2026 · MADE WITH FEELING</span></div>
         <div class='masthead'><div class='logo'><span class='logo-ruby'>Ruby</span> <span class='logo-reader'>Reader</span></div><div class='tagline'>follow your curiosity. keep the lovely bits.</div></div>");
     out.push_str(&art(
         "bow",
@@ -611,7 +654,7 @@ pub fn background(
         a("save",if article.is_some_and(|a|a.saved){"♥ Saved"}else{"♡ Save"},"tool"),
         a("read",if article.is_some_and(|a|a.read){"○ Unread"}else{"✓ Read"},"tool"),
         a("extract","Fetch full article","tool"),a("original","Original ↗","tool"),a("source","Feed / full","tool"),
-        a("find","Find","tool"),a("theme","◐","tool"),a("focus",if focus{"↙ Restore"}else{"↗ Focus"},"tool")));
+        a("find","Find","tool"),"<a href='app:theme' class='tool' aria-label='Change app theme: Light, Sepia, Dark' title='Change app theme: Light, Sepia, Dark'>◐</a>",a("focus",if focus{"↙ Restore"}else{"↗ Focus"},"tool")));
     out.push_str(&format!("<div class='statusbar'><span class='status-heart'>♥</span> {} <span style='float:right'>{} · {} · {}</span></div>",e(status),a("mark-all","Mark view read","status-link"),a("export","Export OPML","status-link"),a("quit","Quit","status-link")));
     out
 }
@@ -770,7 +813,7 @@ pub fn headlines(snap: Option<&Snapshot>, selected: Option<i64>, query: &Query) 
     };
     if snap.articles.is_empty() {
         return format!(
-            "<div class='empty-list'><span style='font-size:34px;color:#d34176'>✧</span><h3>{}</h3><p>{}</p></div>",
+            "<div class='empty-list'><span class='empty-star'>✧</span><h3>{}</h3><p>{}</p></div>",
             if query.search.is_empty() {
                 "A little room for discovery"
             } else {
@@ -844,20 +887,11 @@ pub fn article_html(article: Option<&Article>, full: bool, decora: &Decora) -> S
 }
 
 pub fn article_css(s: &Settings) -> String {
-    let (paper, ink, muted, accent) = match s.reading_theme.as_str() {
-        "dark" => ("#241c2a", "#eee5ed", "#b9a9ba", "#ffa9ce"),
-        "sepia" => ("#f6ead3", "#4b382e", "#8e7261", "#ad355b"),
-        _ => ("#fffdf9", "#302935", "#8a7385", "#bd285f"),
-    };
     format!(
-        "body{{background:{paper};color:{ink}}}.article,.welcome{{background:{paper};color:{ink}}}.prose{{font-size:{}px;line-height:{}}}.prose a{{color:{accent}}}.byline,.article-eyebrow,.endmark{{color:{muted}}}.prose pre,.prose blockquote,.prose th{{background:{};color:{ink}}}",
+        "{}html,body,.article,.welcome{{background:var(--paper);color:var(--reading-ink)}}.prose{{font-size:{}px;line-height:{}}}.prose a{{color:var(--accent)}}.prose a:hover{{color:var(--hover-ink)}}",
+        Theme::from_name(&s.reading_theme).css(),
         s.font_size,
         s.line_height,
-        if s.reading_theme == "dark" {
-            "#37283e"
-        } else {
-            "#faedf1"
-        }
     )
 }
 
@@ -936,10 +970,10 @@ pub fn dialog_html(
                 ("Line spacing",format!("{:.2}",s.line_height),"line-down","line-up"),
                 ("Interface scale",format!("{}%",(s.ui_scale*100.0).round()),"scale-down","scale-up"),
             ] {out.push_str(&format!("<div class='setting-row'><span>{label}</span><span>{} <b>{value}</b> {}</span></div>",a(minus,"−","button"),a(plus,"＋","button")));}
-            out.push_str(&format!("<div class='setting-row'>Reading colors {}</div><div class='setting-row'>Decorative motion {}</div><div class='setting-row'>Desktop notifications {}</div><p class='quiet'>Text stays in your library. Viewed images use a 512 MiB cache.</p>{}",a("theme",&s.reading_theme,"button"),a("motion",if s.reduced_motion{"Reduced"}else{"Very lively ✧"},"button"),a("notifications",if s.notifications{"On"}else{"Off"},"button"),a("clear-cache","Clear image cache","tool")));
+            out.push_str(&format!("<div class='setting-row'>App theme {}</div><div class='setting-row'>Decorative motion {}</div><div class='setting-row'>Desktop notifications {}</div><p class='quiet'>Text stays in your library. Viewed images use a 512 MiB cache.</p>{}",a("theme",Theme::from_name(&s.reading_theme).label(),"button"),a("motion",if s.reduced_motion{"Reduced"}else{"Very lively ✧"},"button"),a("notifications",if s.notifications{"On"}else{"Off"},"button"),a("clear-cache","Clear image cache","tool")));
         }
         Dialog::Discover(feeds)=>for(i,feed)in feeds.iter().enumerate(){out.push_str(&a(&format!("choose-feed:{i}"),&e(&feed.title),"discovered"));},
-        Dialog::Help=>out.push_str("<table class='shortcuts'><tr><td>Ctrl + N</td><td>Add a feed</td></tr><tr><td>Ctrl + K</td><td>Search your collection</td></tr><tr><td>Ctrl + F</td><td>Find in the article</td></tr><tr><td>J / K, ↓ / ↑</td><td>Next / previous story</td></tr><tr><td>S / M</td><td>Save / toggle read</td></tr><tr><td>F / O / R</td><td>Focus / original / refresh</td></tr><tr><td>Space / Shift + Space</td><td>Scroll article down / up</td></tr><tr><td>Tab / Shift + Tab</td><td>Move keyboard focus</td></tr><tr><td>Ctrl + C</td><td>Copy selected text</td></tr><tr><td>Ctrl + Q</td><td>Quit completely</td></tr><tr><td>Escape</td><td>Close dialog / leave focus mode</td></tr></table>"),
+        Dialog::Help=>out.push_str("<table class='shortcuts'><tr><td>Ctrl + N</td><td>Add a feed</td></tr><tr><td>Ctrl + K</td><td>Search your collection</td></tr><tr><td>Ctrl + F</td><td>Find in the article</td></tr><tr><td>J / K, ↓ / ↑</td><td>Next / previous story</td></tr><tr><td>Mouse 4 / 5</td><td>Next / previous story</td></tr><tr><td>S / M</td><td>Save / toggle read</td></tr><tr><td>F / O / R</td><td>Focus / original / refresh</td></tr><tr><td>Space / Shift + Space</td><td>Scroll article down / up</td></tr><tr><td>Tab / Shift + Tab</td><td>Move keyboard focus</td></tr><tr><td>Ctrl + C</td><td>Copy selected text</td></tr><tr><td>Ctrl + Q</td><td>Quit completely</td></tr><tr><td>Escape</td><td>Close dialog / leave focus mode</td></tr></table>"),
         Dialog::Image(source)=>out.push_str(&format!("<img class='enlarged' src='{}' alt='Enlarged article image'>",e(source))),
         _=>{}
     }

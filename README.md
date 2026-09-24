@@ -18,9 +18,9 @@ web of the ’90s. The frame gets the glitter. Your articles get room to breathe
 - **Settle into a proper article.** Images, tables, code, figures, and footnotes
   have a home here. Enlarge images, find a passage, or fetch the full text of a
   public article when its feed only offers a nibble.
-- **Make yourself comfortable.** Light, sepia, and dark reading surfaces;
-  adjustable type and spacing; resizable panes; keyboard shortcuts; and a Focus
-  mode for getting lost in a good story.
+- **Make yourself comfortable.** Light, sepia, and dark themes for the whole app;
+  adjustable type and spacing; resizable panes; keyboard and mouse shortcuts; and
+  a Focus mode for getting lost in a good story.
 - **Poke the accessories.** Each launch picks a fresh, non-repeating arrangement
   from 29 decorations. Click a charm for a little wiggle and a sparkle burst.
   Reduced Motion keeps things calm.

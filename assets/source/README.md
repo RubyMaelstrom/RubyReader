@@ -49,3 +49,11 @@ physical pearls remain part of the objects, not background holes.
 the review. Intermediate source crops and grayscale masks are retained under
 `artifacts/alpha-qc-*`. Pixel tests cover the bracelet hole and require visible
 RGB artwork as well as alpha, so an accidental mask-only export fails validation.
+
+## App theme wallpapers
+
+`gingham.svg` is hand-authored vector artwork. `prepare-wallpapers.py` derives
+warm sepia and deep plum variants by replacing its six colors, preserving the
+checks and lace geometry. Run it with Python 3 from any directory to regenerate
+`assets/gingham-sepia.svg` and `assets/gingham-dark.svg`. Existing Ideogram toys,
+their source RGB, and their transparency masks are unchanged across themes.

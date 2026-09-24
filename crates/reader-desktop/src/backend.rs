@@ -13,19 +13,13 @@ type Mutation = Box<dyn FnOnce(&mut Store) -> anyhow::Result<String> + Send>;
 #[derive(Debug)]
 pub enum Event {
     Snapshot(u64, Result<Snapshot, String>),
-    Article(i64, Result<Article, String>),
+    Article(i64, u64, Result<Article, String>),
+    Extracted(i64, u64, Result<String, String>),
     Changed(Result<String, String>),
     Subscribed(Result<i64, String>),
     Discovered(Result<Vec<DiscoveredFeed>, String>),
-    RefreshDone {
-        new: usize,
-        failed: usize,
-    },
-    Image {
-        i64_id: i64,
-        source: String,
-        bytes: Vec<u8>,
-    },
+    RefreshDone { new: usize, failed: usize },
+    DocumentReady(usize),
     Open,
     Quit,
     Refresh,
@@ -48,6 +42,7 @@ pub struct Backend {
     pub proxy: EventLoopProxy<Event>,
     pub refreshing: Arc<AtomicBool>,
     pending_refresh: Arc<AtomicBool>,
+    image_jobs: Arc<tokio::sync::Semaphore>,
 }
 impl Backend {
     pub fn new(path: PathBuf, proxy: EventLoopProxy<Event>) -> anyhow::Result<Self> {
@@ -73,6 +68,7 @@ impl Backend {
             proxy,
             refreshing: Arc::new(AtomicBool::new(false)),
             pending_refresh: Arc::new(AtomicBool::new(false)),
+            image_jobs: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
     pub fn snapshot(&self, serial: u64, query: Query) {
@@ -87,7 +83,7 @@ impl Backend {
             let _ = this.proxy.send_event(Event::Snapshot(serial, result));
         });
     }
-    pub fn article(&self, id: i64) {
+    pub fn article(&self, id: i64, serial: u64) {
         let this = self.clone();
         self.rt.spawn_blocking(move || {
             let result = this
@@ -96,7 +92,7 @@ impl Backend {
                 .unwrap()
                 .article(id)
                 .map_err(|e| e.to_string());
-            let _ = this.proxy.send_event(Event::Article(id, result));
+            let _ = this.proxy.send_event(Event::Article(id, serial, result));
         });
     }
     pub fn change(&self, job: impl FnOnce(&mut Store) -> anyhow::Result<String> + Send + 'static) {
@@ -131,50 +127,96 @@ impl Backend {
             let _ = this.proxy.send_event(Event::Subscribed(result));
         });
     }
-    pub fn extract(&self, id: i64, address: String) {
+    pub fn extract(&self, id: i64, address: String, serial: u64) -> tokio::task::AbortHandle {
         let this = self.clone();
-        self.rt.spawn(async move {
-            let result = match this.net.extract(&address).await {
-                Ok(html) => this
-                    .store
-                    .lock()
-                    .unwrap()
-                    .extracted(id, &html)
-                    .map(|()| "Full article retrieved".into()),
-                Err(e) => Err(e),
-            }
-            .map_err(|e| e.to_string());
-            let _ = this.proxy.send_event(Event::Changed(result));
-            this.article(id);
-        });
-    }
-    pub fn images(&self, id: i64, sources: Vec<String>) {
-        let this = self.clone();
-        self.rt.spawn(async move {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
-            let mut jobs = tokio::task::JoinSet::new();
-            for source in sources.into_iter().take(256) {
-                let Ok(url) = url::Url::parse(&source) else {
-                    continue;
-                };
-                if !reader_core::content::web_url(&url) {
-                    continue;
-                }
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
-                let net = this.net.clone();
-                let proxy = this.proxy.clone();
-                jobs.spawn(async move {
-                    let _permit = permit;
-                    if let Ok(bytes) = net.image(&url).await {
-                        let _ = proxy.send_event(Event::Image {
-                            i64_id: id,
-                            source,
-                            bytes,
+        self.rt
+            .spawn(async move {
+                match this.net.extract(&address).await {
+                    Ok(html) => {
+                        let proxy = this.proxy.clone();
+                        // Cache through the same FIFO worker as read/save/scroll
+                        // writes. Deliver only the new text, not an old snapshot
+                        // of article state that could undo intervening actions.
+                        this.change(move |db| {
+                            let result = db
+                                .extracted(id, &html)
+                                .map(|()| html)
+                                .map_err(|e| e.to_string());
+                            let _ = proxy.send_event(Event::Extracted(id, serial, result));
+                            Ok(String::new())
                         });
                     }
-                });
+                    Err(e) => {
+                        let _ =
+                            this.proxy
+                                .send_event(Event::Extracted(id, serial, Err(e.to_string())));
+                    }
+                }
+            })
+            .abort_handle()
+    }
+    pub fn images(&self, sink: crate::documents::ImageSink, sources: Vec<String>) {
+        let this = self.clone();
+        self.rt.spawn(async move {
+            let mut cancelled = sink.cancellation();
+            if !sink.current() {
+                return;
             }
-            while jobs.join_next().await.is_some() {}
+            let load = async {
+                let mut jobs = tokio::task::JoinSet::new();
+                for source in sources {
+                    if !sink.current() {
+                        break;
+                    }
+                    let Ok(url) = url::Url::parse(&source) else {
+                        sink.failed(source);
+                        continue;
+                    };
+                    if !reader_core::content::web_url(&url) {
+                        sink.failed(source);
+                        continue;
+                    }
+                    while jobs.len() >= 4 {
+                        jobs.join_next().await;
+                    }
+                    let Ok(permit) = this.image_jobs.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let net = this.net.clone();
+                    let sink = sink.clone();
+                    jobs.spawn(async move {
+                        if !sink.current() {
+                            return;
+                        }
+                        let Ok(bytes) = net.image(&url).await else {
+                            sink.failed(source);
+                            return;
+                        };
+                        if !sink.current() {
+                            return;
+                        }
+                        let decoded = tokio::task::spawn_blocking(move || {
+                            // Blocking decoders cannot be aborted. Keep their
+                            // concurrency slot even if navigation drops the
+                            // async task waiting for this result.
+                            (trust::img::decode_graphical(&bytes), permit)
+                        })
+                        .await;
+                        if let Ok((Ok(image), _permit)) = decoded
+                            && sink.current()
+                        {
+                            sink.supply(source, image).await;
+                        } else {
+                            sink.failed(source);
+                        }
+                    });
+                }
+                while jobs.join_next().await.is_some() {}
+            };
+            tokio::select! {
+                _ = cancelled.changed() => {},
+                _ = load => {},
+            }
         });
     }
     pub fn refresh(&self, only: Option<i64>, due_only: bool) {
